@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 import httpx
 import aiosqlite
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Body
 from fastapi.responses import RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
