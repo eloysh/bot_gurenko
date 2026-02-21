@@ -499,3 +499,75 @@ async def startup():
             await tg_call("setWebhook", {"url": f"{PUBLIC_BASE_URL}/telegram/webhook/hook"})
         except Exception:
             pass
+            from fastapi import Body
+
+@app.get("/api/me")
+async def api_me(tg_id: str):
+    # Минимально — чтобы фронт не падал.
+    # Если хочешь баланс/PRO — добавим позже.
+    return {"tg_id": tg_id, "free": 2, "pro": 0}
+
+@app.post("/api/chat")
+async def api_chat_compat(body: Dict[str, Any] = Body(default={})):
+    # Совместимость: фронт может слать message/text/prompt
+    message = (body.get("message") or body.get("text") or body.get("prompt") or "").strip()
+    provider = body.get("provider")
+    model = body.get("model") or DEFAULT_CHAT_MODEL
+    if provider == "grok":
+        model = GROK_CHAT_MODEL
+
+    if not message:
+        # Чтобы было понятно в UI, почему 400
+        raise HTTPException(status_code=400, detail="Пустое сообщение: ожидаю поле message (или text/prompt)")
+
+    payload = {"model": model, "messages": [{"role": "user", "content": message}]}
+    data = await apifree_post("/v1/chat/completions", payload)
+
+    text = None
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except Exception:
+        pass
+
+    return {"model": model, "text": text, "raw": data}
+
+@app.post("/api/image/submit")
+async def image_submit_compat(body: Dict[str, Any] = Body(default={})):
+    # Совместимость: фронт может слать prompt/text
+    prompt = (body.get("prompt") or body.get("text") or body.get("message") or "").strip()
+    model = body.get("model") or DEFAULT_IMAGE_MODEL
+
+    # chat_id может не приходить — тогда только вернуть job_id/url в UI
+    tg_chat_id = body.get("tg_chat_id") or body.get("chat_id")
+
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt пустой")
+
+    create = await apifree_post("/v1/images/generations", {"model": model, "prompt": prompt})
+
+    # быстрый вариант: если апи сразу отдаёт url — вернём его в UI
+    url = extract_url_from_apifree_response(create)
+    apifree_id = extract_id_from_apifree_response(create) or ""
+
+    # сохраним job
+    await db_exec(
+        "INSERT INTO jobs(kind,status,tg_chat_id,model,prompt,apifree_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("image", "queued", str(tg_chat_id) if tg_chat_id else None, model, prompt, str(apifree_id), now_ts(), now_ts())
+    )
+    row = await db_fetchone("SELECT last_insert_rowid()")
+    job_id = int(row[0]) if row else 0
+
+    # если url уже есть — сразу ок
+    if url:
+        await db_exec("UPDATE jobs SET status=?, result_url=?, updated_at=? WHERE id=?",
+                      ("done", url, now_ts(), job_id))
+        # если есть tg_chat_id — отправим в телеграм
+        if tg_chat_id:
+            await tg_send_photo(str(tg_chat_id), url, caption="✅ Готово (Фото)")
+        return {"job_id": job_id, "status": "done", "url": url}
+
+    # иначе — фоновой поллинг и отправка в телеграм
+    if tg_chat_id:
+        asyncio.create_task(poll_job_to_telegram(job_id))
+
+    return {"job_id": job_id, "status": "queued", "apifree_id": apifree_id}
