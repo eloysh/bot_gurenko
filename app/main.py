@@ -1,573 +1,537 @@
 import os
 import json
-import time
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import httpx
 import aiosqlite
-from fastapi import FastAPI, HTTPException, Request, Body
-from fastapi.responses import RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Body
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# ---------------- ENV ----------------
+# -----------------------------
+# ENV
+# -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/").strip()
-
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")  # https://guurenko-ai.onrender.com
 APIFREE_API_KEY = os.getenv("APIFREE_API_KEY", "").strip()
-APIFREE_BASE_URL = os.getenv("APIFREE_BASE_URL", "https://api.skycoding.ai").rstrip("/").strip()
-APIFREE_HTTP_TIMEOUT_SEC = int(os.getenv("APIFREE_HTTP_TIMEOUT_SEC", "180"))
+APIFREE_BASE_URL = os.getenv("APIFREE_BASE_URL", "https://api.skycoding.ai").strip().rstrip("/")
 
-IMAGE_TIMEOUT_SEC = int(os.getenv("IMAGE_TIMEOUT_SEC", "3600"))   # 1 hour
-IMAGE_POLL_SEC = int(os.getenv("IMAGE_POLL_SEC", "5"))
-
-VIDEO_TIMEOUT_SEC = int(os.getenv("VIDEO_TIMEOUT_SEC", "7200"))   # 2 hours
-VIDEO_POLL_SEC = int(os.getenv("VIDEO_POLL_SEC", "8"))
-
-MUSIC_TIMEOUT_SEC = int(os.getenv("MUSIC_TIMEOUT_SEC", "7200"))
-MUSIC_POLL_SEC = int(os.getenv("MUSIC_POLL_SEC", "8"))
-
-DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "openai/gpt-5.2")
-GROK_CHAT_MODEL = os.getenv("GROK_CHAT_MODEL", "xai/grok-4")
-DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "google/nano-banana-pro")
-DEFAULT_VIDEO_MODEL = os.getenv("DEFAULT_VIDEO_MODEL", "klingai/kling-v2.6/pro/image-to-video")
-DEFAULT_MUSIC_MODEL = os.getenv("DEFAULT_MUSIC_MODEL", "mureka-ai/mureka-v8/generate-song")  # можно поменять на свою
-
+# ВАЖНО: Render Disk должен быть примонтирован на /var/data
 DB_PATH = os.getenv("DB_PATH", "/var/data/app.db").strip()
 
-# ---------------- APP ----------------
-app = FastAPI(title="Creator Mini App Backend", version="1.0.0")
+# Секрет вебхука. У тебя в логах /telegram/webhook/hook
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "hook").strip()
 
-# ---- webapp static mounting (не падаем если нет папки) ----
-BASE_DIR = Path(__file__).resolve().parent          # .../app
-PROJECT_ROOT = BASE_DIR.parent                      # .../
+# Админ(ы) — чтобы не упираться в лимиты/оплаты при тесте
+ADMIN_TG_IDS = set()
+for x in (os.getenv("ADMIN_TG_IDS", "") or "").replace(" ", "").split(","):
+    if x.isdigit():
+        ADMIN_TG_IDS.add(int(x))
 
+# Бесплатные кредиты по умолчанию (чтобы не получать 402 Payment Required)
+INITIAL_FREE = int(os.getenv("INITIAL_FREE", "9999"))
+
+# Таймауты/поллинг для генераций
+IMAGE_TIMEOUT_SEC = int(os.getenv("IMAGE_TIMEOUT_SEC", "3600"))
+IMAGE_POLL_SEC = int(os.getenv("IMAGE_POLL_SEC", "5"))
+VIDEO_TIMEOUT_SEC = int(os.getenv("VIDEO_TIMEOUT_SEC", "7200"))
+VIDEO_POLL_SEC = int(os.getenv("VIDEO_POLL_SEC", "8"))
+MUSIC_TIMEOUT_SEC = int(os.getenv("MUSIC_TIMEOUT_SEC", "3600"))
+MUSIC_POLL_SEC = int(os.getenv("MUSIC_POLL_SEC", "5"))
+
+# Дефолтные модели (можно менять в ENV)
+DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "openai/gpt-5.2").strip()
+GROK_CHAT_MODEL = os.getenv("GROK_CHAT_MODEL", "xai/grok-4").strip()
+
+DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "google/nano-banana-pro").strip()
+DEFAULT_VIDEO_MODEL = os.getenv("DEFAULT_VIDEO_MODEL", "klingai/kling-v2.6/pro/image-to-video").strip()
+DEFAULT_MUSIC_MODEL = os.getenv("DEFAULT_MUSIC_MODEL", "mureka-ai/mureka-v8/generate-song").strip()
+
+APIFREE_HTTP_TIMEOUT_SEC = int(os.getenv("APIFREE_HTTP_TIMEOUT_SEC", "180"))
+
+# -----------------------------
+# APP
+# -----------------------------
+app = FastAPI(title="Creator Mini App Backend", version="2.0.0")
+
+# -----------------------------
+# WEBAPP mount (ищем папку webapp где бы она ни лежала)
+# -----------------------------
+BASE_DIR = Path(__file__).resolve().parent  # .../app
 CANDIDATES = [
     BASE_DIR / "webapp",
-    PROJECT_ROOT / "webapp",
-    PROJECT_ROOT / "web",
+    BASE_DIR.parent / "webapp",
+    BASE_DIR.parent / "web",
+    BASE_DIR / "web",
 ]
-WEBAPP_DIR = next((p for p in CANDIDATES if p.exists() and p.is_dir()), None)
+WEBAPP_DIR = None
+for p in CANDIDATES:
+    if p.exists() and p.is_dir():
+        WEBAPP_DIR = p
+        break
 
 if WEBAPP_DIR:
     app.mount("/webapp", StaticFiles(directory=str(WEBAPP_DIR), html=True), name="webapp")
 
-    @app.get("/", include_in_schema=False)
-    async def root():
-        return RedirectResponse(url="/webapp/")
-else:
-    @app.get("/", include_in_schema=False)
-    async def root_missing():
-        return PlainTextResponse(
-            "WEBAPP folder not found. Create webapp/index.html (or app/webapp/index.html).",
-            status_code=500
-        )
 
-# ---------------- DB ----------------
+# -----------------------------
+# DB helpers
+# -----------------------------
 async def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY,
+            free_credits INTEGER NOT NULL DEFAULT 0,
+            pro_credits INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,              -- image|video|music
-            status TEXT NOT NULL,            -- queued|running|done|error
-            tg_chat_id TEXT,
-            tg_user_id TEXT,
+            id TEXT PRIMARY KEY,
+            tg_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,          -- image/video/music
+            status TEXT NOT NULL,        -- queued/running/done/error
             model TEXT,
-            prompt TEXT,
-            apifree_id TEXT,
-            result_url TEXT,
-            error TEXT,
-            created_at INTEGER,
-            updated_at INTEGER
+            request_json TEXT,
+            result_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
         )
         """)
         await db.commit()
 
-async def db_exec(sql: str, args: tuple = ()):
+
+async def get_or_create_user(tg_id: int) -> Dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(sql, args)
+        row = await db.execute_fetchone("SELECT tg_id, free_credits, pro_credits FROM users WHERE tg_id=?", (tg_id,))
+        if row:
+            return {"tg_id": row[0], "free": row[1], "pro": row[2]}
+
+        await db.execute(
+            "INSERT INTO users(tg_id, free_credits, pro_credits) VALUES (?,?,?)",
+            (tg_id, INITIAL_FREE, 0),
+        )
+        await db.commit()
+        return {"tg_id": tg_id, "free": INITIAL_FREE, "pro": 0}
+
+
+async def consume_credit(tg_id: int) -> bool:
+    if tg_id in ADMIN_TG_IDS:
+        return True
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await db.execute_fetchone("SELECT free_credits, pro_credits FROM users WHERE tg_id=?", (tg_id,))
+        if not row:
+            await get_or_create_user(tg_id)
+            row = (INITIAL_FREE, 0)
+
+        free, pro = row
+        if pro > 0:
+            await db.execute("UPDATE users SET pro_credits=pro_credits-1 WHERE tg_id=?", (tg_id,))
+            await db.commit()
+            return True
+        if free > 0:
+            await db.execute("UPDATE users SET free_credits=free_credits-1 WHERE tg_id=?", (tg_id,))
+            await db.commit()
+            return True
+        return False
+
+
+async def save_job(job_id: str, tg_id: int, kind: str, status: str, model: str, req: Dict[str, Any], res: Optional[Dict[str, Any]] = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT OR REPLACE INTO jobs(id, tg_id, kind, status, model, request_json, result_json, updated_at)
+        VALUES(?,?,?,?,?,?,?, datetime('now'))
+        """, (
+            job_id, tg_id, kind, status, model,
+            json.dumps(req, ensure_ascii=False),
+            json.dumps(res or {}, ensure_ascii=False),
+        ))
         await db.commit()
 
-async def db_fetchone(sql: str, args: tuple = ()):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(sql, args)
-        row = await cur.fetchone()
-        await cur.close()
-        return row
 
-# ---------------- HELPERS ----------------
-def now_ts() -> int:
-    return int(time.time())
+async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await db.execute_fetchone("SELECT id, tg_id, kind, status, model, request_json, result_json FROM jobs WHERE id=?", (job_id,))
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "tg_id": row[1],
+            "kind": row[2],
+            "status": row[3],
+            "model": row[4],
+            "request": json.loads(row[5] or "{}"),
+            "result": json.loads(row[6] or "{}"),
+        }
+
+
+# -----------------------------
+# API FREE client
+# -----------------------------
+def _apifree_headers() -> Dict[str, str]:
+    if not APIFREE_API_KEY:
+        raise HTTPException(status_code=500, detail="APIFREE_API_KEY не задан")
+    return {"Authorization": f"Bearer {APIFREE_API_KEY}"}
+
 
 async def apifree_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not APIFREE_API_KEY:
-        raise HTTPException(status_code=500, detail="APIFREE_API_KEY не задан")
-
     url = f"{APIFREE_BASE_URL}{endpoint}"
-    headers = {"Authorization": f"Bearer {APIFREE_API_KEY}"}
     timeout = httpx.Timeout(APIFREE_HTTP_TIMEOUT_SEC)
-
     async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, json=payload, headers=headers)
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-
-    # ВАЖНО: 402 Payment Required — это не “ошибка кода”, а платная модель/лимит
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=data)
-
-    return data
-
-async def apifree_get(endpoint: str) -> Dict[str, Any]:
-    if not APIFREE_API_KEY:
-        raise HTTPException(status_code=500, detail="APIFREE_API_KEY не задан")
-
-    url = f"{APIFREE_BASE_URL}{endpoint}"
-    headers = {"Authorization": f"Bearer {APIFREE_API_KEY}"}
-    timeout = httpx.Timeout(APIFREE_HTTP_TIMEOUT_SEC)
-
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url, headers=headers)
-
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw": r.text}
-
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=data)
-
-    return data
-
-async def tg_call(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not BOT_TOKEN:
-        return {"ok": False, "error": "BOT_TOKEN missing"}
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, json=payload)
-    try:
-        return r.json()
-    except Exception:
-        return {"ok": False, "raw": r.text}
-
-async def tg_send_text(chat_id: str, text: str):
-    await tg_call("sendMessage", {"chat_id": chat_id, "text": text})
-
-async def tg_send_photo(chat_id: str, photo_url: str, caption: Optional[str] = None):
-    payload = {"chat_id": chat_id, "photo": photo_url}
-    if caption:
-        payload["caption"] = caption
-    await tg_call("sendPhoto", payload)
-
-async def tg_send_video(chat_id: str, video_url: str, caption: Optional[str] = None):
-    payload = {"chat_id": chat_id, "video": video_url}
-    if caption:
-        payload["caption"] = caption
-    await tg_call("sendVideo", payload)
-
-async def tg_send_audio(chat_id: str, audio_url: str, caption: Optional[str] = None):
-    payload = {"chat_id": chat_id, "audio": audio_url}
-    if caption:
-        payload["caption"] = caption
-    await tg_call("sendAudio", payload)
-
-# ---------------- POLLING LOGIC ----------------
-def extract_url_from_apifree_response(data: Dict[str, Any]) -> Optional[str]:
-    # Поддерживаем разные форматы
-    if isinstance(data.get("url"), str) and data["url"].startswith("http"):
-        return data["url"]
-
-    d = data.get("data")
-    if isinstance(d, list) and d:
-        u = d[0].get("url")
-        if isinstance(u, str) and u.startswith("http"):
-            return u
-
-    # Иногда result лежит глубже
-    for k in ["result", "output", "file", "media"]:
-        v = data.get(k)
-        if isinstance(v, dict):
-            u = v.get("url")
-            if isinstance(u, str) and u.startswith("http"):
-                return u
-        if isinstance(v, str) and v.startswith("http"):
-            return v
-
-    return None
-
-def extract_id_from_apifree_response(data: Dict[str, Any]) -> Optional[str]:
-    # Самые частые варианты: id / job_id
-    for k in ["id", "job_id", "task_id"]:
-        v = data.get(k)
-        if isinstance(v, (str, int)):
-            return str(v)
-    # Иногда "data":[{"id":...}]
-    d = data.get("data")
-    if isinstance(d, list) and d:
-        v = d[0].get("id")
-        if isinstance(v, (str, int)):
-            return str(v)
-    return None
-
-async def poll_job_to_telegram(job_id: int):
-    # Достаём job
-    row = await db_fetchone(
-        "SELECT kind, tg_chat_id, model, prompt, apifree_id, created_at FROM jobs WHERE id=?",
-        (job_id,)
-    )
-    if not row:
-        return
-
-    kind, tg_chat_id, model, prompt, apifree_id, created_at = row
-    if not tg_chat_id:
-        return
-
-    if kind == "image":
-        timeout_sec, poll_sec = IMAGE_TIMEOUT_SEC, IMAGE_POLL_SEC
-        result_endpoint = f"/api/image/result/{apifree_id}"
-    elif kind == "video":
-        timeout_sec, poll_sec = VIDEO_TIMEOUT_SEC, VIDEO_POLL_SEC
-        result_endpoint = f"/api/video/result/{apifree_id}"
-    else:
-        timeout_sec, poll_sec = MUSIC_TIMEOUT_SEC, MUSIC_POLL_SEC
-        result_endpoint = f"/api/music/result/{apifree_id}"
-
-    await tg_send_text(tg_chat_id, f"⏳ Запрос принят. Генерирую {kind}…")
-
-    deadline = created_at + timeout_sec
-    last_status_msg = 0
-
-    while now_ts() < deadline:
+        r = await client.post(url, json=payload, headers=_apifree_headers())
         try:
-            # Мы вызываем НАШ endpoint, который внизу оборачивает apifree result
-            # но можно и напрямую apifree — так проще держать одну логику
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(f"{PUBLIC_BASE_URL}{result_endpoint}")
-            data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
 
-            # Ожидаем готовность: ищем url
-            url = None
-            if isinstance(data, dict):
-                url = data.get("url") or extract_url_from_apifree_response(data)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail={"provider_error": True, "status": r.status_code, "resp": data})
+    return data
 
-            if url and isinstance(url, str) and url.startswith("http"):
-                await db_exec(
-                    "UPDATE jobs SET status=?, result_url=?, updated_at=? WHERE id=?",
-                    ("done", url, now_ts(), job_id)
-                )
 
-                if kind == "image":
-                    await tg_send_photo(tg_chat_id, url, caption="✅ Готово (Фото)")
-                elif kind == "video":
-                    await tg_send_video(tg_chat_id, url, caption="✅ Готово (Видео)")
-                else:
-                    await tg_send_audio(tg_chat_id, url, caption="✅ Готово (Музыка)")
+# -----------------------------
+# Models catalog (чтобы выпадашки НЕ были пустыми)
+# Можно переопределить ENV: MODELS_JSON
+# -----------------------------
+DEFAULT_MODELS = {
+    "chat": [
+        {"id": DEFAULT_CHAT_MODEL, "name": "ChatGPT"},
+        {"id": GROK_CHAT_MODEL, "name": "Grok"},
+    ],
+    "image": [
+        {"id": DEFAULT_IMAGE_MODEL, "name": "Nano Banana"},
+    ],
+    "video": [
+        {"id": DEFAULT_VIDEO_MODEL, "name": "Kling I2V"},
+    ],
+    "music": [
+        {"id": DEFAULT_MUSIC_MODEL, "name": "Mureka V8"},
+    ],
+}
 
-                return
 
-            # Периодически пингуем статус в чат, чтобы “не молчало”
-            if now_ts() - last_status_msg > 120:
-                last_status_msg = now_ts()
-                await tg_send_text(tg_chat_id, "⏳ Всё ещё генерирую… (это может занять время)")
+def get_models_catalog() -> Dict[str, Any]:
+    raw = os.getenv("MODELS_JSON", "").strip()
+    if not raw:
+        return DEFAULT_MODELS
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return DEFAULT_MODELS
 
-        except Exception as e:
-            # Не валим процесс — подождём и продолжим
-            await asyncio.sleep(poll_sec)
-            continue
 
-        await asyncio.sleep(poll_sec)
+# -----------------------------
+# Startup
+# -----------------------------
+@app.on_event("startup")
+async def _startup():
+    await init_db()
 
-    # timeout
-    await db_exec(
-        "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
-        ("error", f"timeout after {timeout_sec}s", now_ts(), job_id)
-    )
-    await tg_send_text(
-        tg_chat_id,
-        f"⚠️ Не дождалась результата за {timeout_sec} сек.\n"
-        f"Причины: длинная генерация / платная модель / лимиты.\n"
-        f"Попробуй другую модель или повтори позже."
-    )
 
-# ---------------- TELEGRAM WEBHOOK ----------------
-@app.post("/telegram/webhook/hook")
-async def telegram_webhook(req: Request):
+# -----------------------------
+# Routes: WEB
+# -----------------------------
+@app.get("/")
+async def root():
+    if WEBAPP_DIR:
+        return RedirectResponse("/webapp/")
+    return HTMLResponse("<h3>Backend is running. No webapp folder found.</h3>")
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+# -----------------------------
+# Routes: MiniApp API
+# -----------------------------
+@app.get("/api/models")
+async def api_models():
+    return {"ok": True, "models": get_models_catalog()}
+
+
+@app.get("/api/me")
+async def api_me(tg_id: int):
+    # ВАЖНО: раньше у тебя тут был 404 -> ломалось всё дальше
+    u = await get_or_create_user(int(tg_id))
+    return {"ok": True, **u}
+
+
+@app.post("/api/chat")
+async def api_chat(payload: Dict[str, Any] = Body(default={})):
+    tg_id = int(payload.get("tg_id", 0))
+    text = (payload.get("text") or "").strip()
+    provider = (payload.get("provider") or "").strip().lower()
+    model = (payload.get("model") or "").strip()
+
+    if not tg_id or not text:
+        raise HTTPException(status_code=400, detail="tg_id and text required")
+
+    ok = await consume_credit(tg_id)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "no_credits"}, status_code=402)
+
+    if provider == "grok":
+        model = model or GROK_CHAT_MODEL
+    else:
+        model = model or DEFAULT_CHAT_MODEL
+
+    data = await apifree_post("/v1/chat/completions", {
+        "model": model,
+        "messages": [{"role": "user", "content": text}]
+    })
+    answer = None
+    try:
+        answer = data["choices"][0]["message"]["content"]
+    except Exception:
+        answer = json.dumps(data, ensure_ascii=False)
+
+    return {"ok": True, "answer": answer, "model": model}
+
+
+# ---- IMAGE (submit/result) ----
+@app.post("/api/image/submit")
+async def api_image_submit(payload: Dict[str, Any] = Body(default={})):
+    tg_id = int(payload.get("tg_id", 0))
+    prompt = (payload.get("prompt") or "").strip()
+    model = (payload.get("model") or DEFAULT_IMAGE_MODEL).strip()
+
+    if not tg_id or not prompt:
+        raise HTTPException(status_code=400, detail="tg_id and prompt required")
+
+    ok = await consume_credit(tg_id)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "no_credits"}, status_code=402)
+
+    create = await apifree_post("/v1/images/generations", {"model": model, "prompt": prompt})
+
+    # В зависимости от провайдера это может быть url сразу или id/operation
+    job_id = str(create.get("id") or create.get("job_id") or create.get("operation_id") or create.get("request_id") or "")
+    url = create.get("url")
+
+    if not job_id and url:
+        job_id = f"img_{abs(hash(url))}"
+
+    await save_job(job_id, tg_id, "image", "running", model, {"prompt": prompt}, create)
+
+    return {"ok": True, "id": job_id, "status": "running", "url": url, "raw": create}
+
+
+@app.get("/api/image/result/{job_id}")
+async def api_image_result(job_id: str):
+    job = await get_job(job_id)
+    if not job:
+        return {"ok": False, "status": "not_found"}
+
+    # если url уже есть — готово
+    raw = job["result"] or {}
+    url = raw.get("url")
+    if url:
+        await save_job(job_id, job["tg_id"], "image", "done", job["model"], job["request"], raw)
+        return {"ok": True, "status": "done", "url": url, "raw": raw}
+
+    # иначе пробуем “подождать” через повторный запрос (если провайдер поддерживает)
+    # тут универсально: просто возвращаем running
+    return {"ok": True, "status": "running", "raw": raw}
+
+
+# ---- VIDEO (submit/result) ----
+@app.post("/api/video/submit")
+async def api_video_submit(payload: Dict[str, Any] = Body(default={})):
+    tg_id = int(payload.get("tg_id", 0))
+    prompt = (payload.get("prompt") or "").strip()
+    model = (payload.get("model") or DEFAULT_VIDEO_MODEL).strip()
+
+    if not tg_id or not prompt:
+        raise HTTPException(status_code=400, detail="tg_id and prompt required")
+
+    ok = await consume_credit(tg_id)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "no_credits"}, status_code=402)
+
+    create = await apifree_post("/v1/videos/generations", {"model": model, "prompt": prompt})
+    job_id = str(create.get("id") or create.get("job_id") or create.get("operation_id") or create.get("request_id") or "")
+    url = create.get("url")
+    if not job_id and url:
+        job_id = f"vid_{abs(hash(url))}"
+
+    await save_job(job_id, tg_id, "video", "running", model, {"prompt": prompt}, create)
+    return {"ok": True, "id": job_id, "status": "running", "url": url, "raw": create}
+
+
+@app.get("/api/video/result/{job_id}")
+async def api_video_result(job_id: str):
+    job = await get_job(job_id)
+    if not job:
+        return {"ok": False, "status": "not_found"}
+
+    raw = job["result"] or {}
+    url = raw.get("url")
+    if url:
+        await save_job(job_id, job["tg_id"], "video", "done", job["model"], job["request"], raw)
+        return {"ok": True, "status": "done", "url": url, "raw": raw}
+    return {"ok": True, "status": "running", "raw": raw}
+
+
+# ---- MUSIC (submit/result) ----
+@app.post("/api/music/submit")
+async def api_music_submit(payload: Dict[str, Any] = Body(default={})):
+    tg_id = int(payload.get("tg_id", 0))
+    lyrics = (payload.get("lyrics") or "").strip()
+    style = (payload.get("style") or "").strip()
+    model = (payload.get("model") or DEFAULT_MUSIC_MODEL).strip()
+
+    if not tg_id or not lyrics:
+        raise HTTPException(status_code=400, detail="tg_id and lyrics required")
+
+    ok = await consume_credit(tg_id)
+    if not ok:
+        return JSONResponse({"ok": False, "error": "no_credits"}, status_code=402)
+
+    req = {"model": model, "lyrics": lyrics}
+    if style:
+        req["style"] = style
+
+    create = await apifree_post("/v1/music/generations", req)
+
+    job_id = str(create.get("id") or create.get("job_id") or create.get("operation_id") or create.get("request_id") or "")
+    url = create.get("url")
+    if not job_id and url:
+        job_id = f"mus_{abs(hash(url))}"
+
+    await save_job(job_id, tg_id, "music", "running", model, req, create)
+    return {"ok": True, "id": job_id, "status": "running", "url": url, "raw": create}
+
+
+@app.get("/api/music/result/{job_id}")
+async def api_music_result(job_id: str):
+    job = await get_job(job_id)
+    if not job:
+        return {"ok": False, "status": "not_found"}
+
+    raw = job["result"] or {}
+    url = raw.get("url")
+    if url:
+        await save_job(job_id, job["tg_id"], "music", "done", job["model"], job["request"], raw)
+        return {"ok": True, "status": "done", "url": url, "raw": raw}
+    return {"ok": True, "status": "running", "raw": raw}
+
+
+# -----------------------------
+# Telegram helpers
+# -----------------------------
+async def tg_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
+    if not BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient(timeout=30) as client:
+        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json=payload)
+
+
+async def tg_send_document(chat_id: int, file_url: str, caption: str = ""):
+    if not BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "document": file_url}
+    if caption:
+        payload["caption"] = caption
+    async with httpx.AsyncClient(timeout=30) as client:
+        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument", json=payload)
+
+
+async def poll_and_send(chat_id: int, kind: str, job_id: str):
+    # фоновой опрос, чтобы не ждать 690 сек в webhook
+    timeout = {"image": IMAGE_TIMEOUT_SEC, "video": VIDEO_TIMEOUT_SEC, "music": MUSIC_TIMEOUT_SEC}.get(kind, 3600)
+    poll = {"image": IMAGE_POLL_SEC, "video": VIDEO_POLL_SEC, "music": MUSIC_POLL_SEC}.get(kind, 5)
+
+    start = asyncio.get_event_loop().time()
+    while True:
+        if asyncio.get_event_loop().time() - start > timeout:
+            await tg_send_message(chat_id, "⏳ Не дождалась результата. Попробуй ещё раз или другую модель.")
+            return
+
+        job = await get_job(job_id)
+        if job and (job["result"] or {}).get("url"):
+            url = job["result"]["url"]
+            # по твоей просьбе — отправляем как Document
+            await tg_send_document(chat_id, url, caption="✅ Готово")
+            return
+
+        await asyncio.sleep(poll)
+
+
+# -----------------------------
+# Telegram webhook
+# -----------------------------
+@app.post(f"/telegram/webhook/{WEBHOOK_SECRET}")
+async def telegram_webhook(req: Request, background: BackgroundTasks):
     update = await req.json()
-    message = (update.get("message") or {})
-    text = (message.get("text") or "").strip()
-    chat = message.get("chat") or {}
+    msg = update.get("message") or {}
+    text = (msg.get("text") or "").strip()
+    chat = msg.get("chat") or {}
     chat_id = chat.get("id")
 
     if not chat_id:
         return {"ok": True}
 
-    # /start -> кнопка Mini App
+    # /start -> кнопка MiniApp
     if text.startswith("/start"):
-        miniapp_url = PUBLIC_BASE_URL + "/webapp/" if PUBLIC_BASE_URL else "https://guurenko-ai.onrender.com/webapp/"
-        await tg_call("sendMessage", {
-            "chat_id": chat_id,
-            "text": "Привет! Открывай Mini App 👇",
-            "reply_markup": {
+        miniapp_url = PUBLIC_BASE_URL or ""
+        if not miniapp_url:
+            # fallback — попытка взять из webhook url
+            miniapp_url = "https://guurenko-ai.onrender.com"
+        await tg_send_message(
+            chat_id,
+            "Привет! Открывай Mini App 👇",
+            reply_markup={
                 "inline_keyboard": [[
-                    {"text": "Открыть Mini App", "web_app": {"url": miniapp_url}}
+                    {"text": "Открыть Mini App", "web_app": {"url": f"{miniapp_url}/webapp/"}}
                 ]]
             }
-        })
+        )
         return {"ok": True}
 
+    # (необязательно) если пользователь пишет прямо боту:
+    # фото: ... / видео: ... / музыка: ...
+    low = text.lower()
+    if low.startswith("фото:"):
+        prompt = text.split(":", 1)[1].strip()
+        create = await api_image_submit({"tg_id": int(chat_id), "prompt": prompt, "model": DEFAULT_IMAGE_MODEL})
+        job_id = create.get("id")
+        await tg_send_message(chat_id, "🖼️ Приняла. Генерирую…")
+        background.add_task(poll_and_send, chat_id, "image", job_id)
+        return {"ok": True}
+
+    if low.startswith("видео:"):
+        prompt = text.split(":", 1)[1].strip()
+        create = await api_video_submit({"tg_id": int(chat_id), "prompt": prompt, "model": DEFAULT_VIDEO_MODEL})
+        job_id = create.get("id")
+        await tg_send_message(chat_id, "🎬 Приняла. Генерирую…")
+        background.add_task(poll_and_send, chat_id, "video", job_id)
+        return {"ok": True}
+
+    if low.startswith("музыка:"):
+        lyrics = text.split(":", 1)[1].strip()
+        create = await api_music_submit({"tg_id": int(chat_id), "lyrics": lyrics, "style": "", "model": DEFAULT_MUSIC_MODEL})
+        job_id = create.get("id")
+        await tg_send_message(chat_id, "🎵 Приняла. Генерирую…")
+        background.add_task(poll_and_send, chat_id, "music", job_id)
+        return {"ok": True}
+
+    # иначе просто подсказка
+    await tg_send_message(chat_id, "Открой Mini App через /start или напиши:\nфото: ...\nвидео: ...\nмузыка: ...")
     return {"ok": True}
-
-# ---------------- API (Mini App) ----------------
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.get("/api/models")
-async def models():
-    # Можно расширить список (и дальше он появится в UI)
-    return {
-        "chat": [DEFAULT_CHAT_MODEL, GROK_CHAT_MODEL],
-        "image": [DEFAULT_IMAGE_MODEL, "google/nano-banana-pro", "google/nano-banana"],
-        "video": [DEFAULT_VIDEO_MODEL, "klingai/kling-v2.6/pro/image-to-video"],
-        "music": [DEFAULT_MUSIC_MODEL, "suno/suno-v4", "suno/suno-v3.5"]
-    }
-
-@app.post("/api/chat")
-async def api_chat(body: Dict[str, Any]):
-    message = (body or {}).get("message", "").strip()
-    provider = (body or {}).get("provider")
-    model = (body or {}).get("model") or DEFAULT_CHAT_MODEL
-    if provider == "grok":
-        model = GROK_CHAT_MODEL
-    if not message:
-        raise HTTPException(status_code=400, detail="message пустой")
-
-    payload = {"model": model, "messages": [{"role": "user", "content": message}]}
-    data = await apifree_post("/v1/chat/completions", payload)
-
-    text = None
-    try:
-        text = data["choices"][0]["message"]["content"]
-    except Exception:
-        text = None
-
-    return {"model": model, "text": text, "raw": data}
-
-# --- IMAGE submit/result ---
-@app.post("/api/image/submit")
-async def image_submit(body: Dict[str, Any]):
-    prompt = (body or {}).get("prompt", "").strip()
-    model = (body or {}).get("model") or DEFAULT_IMAGE_MODEL
-    tg_chat_id = (body or {}).get("tg_chat_id")  # важно: Mini App должен передавать chat_id
-
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt пустой")
-
-    # 1) создать задачу в apifree
-    create = await apifree_post("/v1/images/generations", {"model": model, "prompt": prompt})
-    url = extract_url_from_apifree_response(create)
-    apifree_id = extract_id_from_apifree_response(create) or create.get("id") or create.get("job") or ""
-
-    # 2) сохранить job
-    await db_exec(
-        "INSERT INTO jobs(kind,status,tg_chat_id,model,prompt,apifree_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("image", "queued", str(tg_chat_id) if tg_chat_id else None, model, prompt, str(apifree_id), now_ts(), now_ts())
-    )
-    row = await db_fetchone("SELECT last_insert_rowid()")
-    job_id = int(row[0]) if row else 0
-
-    # 3) если url уже есть — сразу в tg (если chat_id есть)
-    if url and tg_chat_id:
-        await db_exec("UPDATE jobs SET status=?, result_url=?, updated_at=? WHERE id=?",
-                      ("done", url, now_ts(), job_id))
-        await tg_send_photo(str(tg_chat_id), url, caption="✅ Готово (Фото)")
-        return {"job_id": job_id, "status": "done", "url": url}
-
-    # 4) иначе — в фоне ждём
-    if tg_chat_id:
-        asyncio.create_task(poll_job_to_telegram(job_id))
-
-    return {"job_id": job_id, "status": "queued", "apifree_id": apifree_id}
-
-@app.get("/api/image/result/{apifree_id}")
-async def image_result(apifree_id: str):
-    # Если у apifree есть специальный endpoint результата — укажи его тут.
-    # Я оставляю универсально: часто это /v1/images/generations/{id}
-    data = await apifree_get(f"/v1/images/generations/{apifree_id}")
-    url = extract_url_from_apifree_response(data)
-    return {"url": url, "raw": data}
-
-# --- VIDEO submit/result ---
-@app.post("/api/video/submit")
-async def video_submit(body: Dict[str, Any]):
-    prompt = (body or {}).get("prompt", "").strip()
-    model = (body or {}).get("model") or DEFAULT_VIDEO_MODEL
-    tg_chat_id = (body or {}).get("tg_chat_id")
-
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt пустой")
-
-    create = await apifree_post("/v1/videos/generations", {"model": model, "prompt": prompt})
-    url = extract_url_from_apifree_response(create)
-    apifree_id = extract_id_from_apifree_response(create) or ""
-
-    await db_exec(
-        "INSERT INTO jobs(kind,status,tg_chat_id,model,prompt,apifree_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("video", "queued", str(tg_chat_id) if tg_chat_id else None, model, prompt, str(apifree_id), now_ts(), now_ts())
-    )
-    row = await db_fetchone("SELECT last_insert_rowid()")
-    job_id = int(row[0]) if row else 0
-
-    if url and tg_chat_id:
-        await db_exec("UPDATE jobs SET status=?, result_url=?, updated_at=? WHERE id=?",
-                      ("done", url, now_ts(), job_id))
-        await tg_send_video(str(tg_chat_id), url, caption="✅ Готово (Видео)")
-        return {"job_id": job_id, "status": "done", "url": url}
-
-    if tg_chat_id:
-        asyncio.create_task(poll_job_to_telegram(job_id))
-
-    return {"job_id": job_id, "status": "queued", "apifree_id": apifree_id}
-
-@app.get("/api/video/result/{apifree_id}")
-async def video_result(apifree_id: str):
-    data = await apifree_get(f"/v1/videos/generations/{apifree_id}")
-    url = extract_url_from_apifree_response(data)
-    return {"url": url, "raw": data}
-
-# --- MUSIC submit/result ---
-@app.post("/api/music/submit")
-async def music_submit(body: Dict[str, Any]):
-    lyrics = (body or {}).get("lyrics", "").strip()
-    style = (body or {}).get("style", "").strip()
-    model = (body or {}).get("model") or DEFAULT_MUSIC_MODEL
-    tg_chat_id = (body or {}).get("tg_chat_id")
-
-    if not lyrics:
-        raise HTTPException(status_code=400, detail="lyrics пустой")
-
-    payload = {"model": model, "lyrics": lyrics}
-    if style:
-        payload["style"] = style
-
-    create = await apifree_post("/v1/music/generations", payload)
-    url = extract_url_from_apifree_response(create)
-    apifree_id = extract_id_from_apifree_response(create) or ""
-
-    await db_exec(
-        "INSERT INTO jobs(kind,status,tg_chat_id,model,prompt,apifree_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("music", "queued", str(tg_chat_id) if tg_chat_id else None, model, lyrics[:5000], str(apifree_id), now_ts(), now_ts())
-    )
-    row = await db_fetchone("SELECT last_insert_rowid()")
-    job_id = int(row[0]) if row else 0
-
-    if url and tg_chat_id:
-        await db_exec("UPDATE jobs SET status=?, result_url=?, updated_at=? WHERE id=?",
-                      ("done", url, now_ts(), job_id))
-        await tg_send_audio(str(tg_chat_id), url, caption="✅ Готово (Музыка)")
-        return {"job_id": job_id, "status": "done", "url": url}
-
-    if tg_chat_id:
-        asyncio.create_task(poll_job_to_telegram(job_id))
-
-    return {"job_id": job_id, "status": "queued", "apifree_id": apifree_id}
-
-@app.get("/api/music/result/{apifree_id}")
-async def music_result(apifree_id: str):
-    data = await apifree_get(f"/v1/music/generations/{apifree_id}")
-    url = extract_url_from_apifree_response(data)
-    return {"url": url, "raw": data}
-
-# ---------------- STARTUP ----------------
-@app.on_event("startup")
-async def startup():
-    await init_db()
-
-    # setWebhook (если задан PUBLIC_BASE_URL)
-    if BOT_TOKEN and PUBLIC_BASE_URL:
-        try:
-            await tg_call("setWebhook", {"url": f"{PUBLIC_BASE_URL}/telegram/webhook/hook"})
-        except Exception:
-            pass
-            from fastapi import Body
-
-@app.get("/api/me")
-async def api_me(tg_id: str):
-    # Минимально — чтобы фронт не падал.
-    # Если хочешь баланс/PRO — добавим позже.
-    return {"tg_id": tg_id, "free": 2, "pro": 0}
-
-@app.post("/api/chat")
-async def api_chat_compat(body: Dict[str, Any] = Body(default={})):
-    # Совместимость: фронт может слать message/text/prompt
-    message = (body.get("message") or body.get("text") or body.get("prompt") or "").strip()
-    provider = body.get("provider")
-    model = body.get("model") or DEFAULT_CHAT_MODEL
-    if provider == "grok":
-        model = GROK_CHAT_MODEL
-
-    if not message:
-        # Чтобы было понятно в UI, почему 400
-        raise HTTPException(status_code=400, detail="Пустое сообщение: ожидаю поле message (или text/prompt)")
-
-    payload = {"model": model, "messages": [{"role": "user", "content": message}]}
-    data = await apifree_post("/v1/chat/completions", payload)
-
-    text = None
-    try:
-        text = data["choices"][0]["message"]["content"]
-    except Exception:
-        pass
-
-    return {"model": model, "text": text, "raw": data}
-
-@app.post("/api/image/submit")
-async def image_submit_compat(body: Dict[str, Any] = Body(default={})):
-    # Совместимость: фронт может слать prompt/text
-    prompt = (body.get("prompt") or body.get("text") or body.get("message") or "").strip()
-    model = body.get("model") or DEFAULT_IMAGE_MODEL
-
-    # chat_id может не приходить — тогда только вернуть job_id/url в UI
-    tg_chat_id = body.get("tg_chat_id") or body.get("chat_id")
-
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt пустой")
-
-    create = await apifree_post("/v1/images/generations", {"model": model, "prompt": prompt})
-
-    # быстрый вариант: если апи сразу отдаёт url — вернём его в UI
-    url = extract_url_from_apifree_response(create)
-    apifree_id = extract_id_from_apifree_response(create) or ""
-
-    # сохраним job
-    await db_exec(
-        "INSERT INTO jobs(kind,status,tg_chat_id,model,prompt,apifree_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
-        ("image", "queued", str(tg_chat_id) if tg_chat_id else None, model, prompt, str(apifree_id), now_ts(), now_ts())
-    )
-    row = await db_fetchone("SELECT last_insert_rowid()")
-    job_id = int(row[0]) if row else 0
-
-    # если url уже есть — сразу ок
-    if url:
-        await db_exec("UPDATE jobs SET status=?, result_url=?, updated_at=? WHERE id=?",
-                      ("done", url, now_ts(), job_id))
-        # если есть tg_chat_id — отправим в телеграм
-        if tg_chat_id:
-            await tg_send_photo(str(tg_chat_id), url, caption="✅ Готово (Фото)")
-        return {"job_id": job_id, "status": "done", "url": url}
-
-    # иначе — фоновой поллинг и отправка в телеграм
-    if tg_chat_id:
-        asyncio.create_task(poll_job_to_telegram(job_id))
-
-    return {"job_id": job_id, "status": "queued", "apifree_id": apifree_id}
