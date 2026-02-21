@@ -35,7 +35,7 @@ DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "openai/gpt-5.2")
 GROK_CHAT_MODEL = os.getenv("GROK_CHAT_MODEL", "xai/grok-4")
 DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "google/nano-banana-pro")
 DEFAULT_VIDEO_MODEL = os.getenv("DEFAULT_VIDEO_MODEL", "klingai/kling-v2.6/pro/image-to-video")
-DEFAULT_MUSIC_MODEL = os.getenv("DEFAULT_MUSIC_MODEL", "suno/suno-v4")  # можно поменять на свою
+DEFAULT_MUSIC_MODEL = os.getenv("DEFAULT_MUSIC_MODEL", "mureka-ai/mureka-v8/generate-song")  # можно поменять на свою
 
 DB_PATH = os.getenv("DB_PATH", "/var/data/app.db").strip()
 
