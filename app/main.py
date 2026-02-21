@@ -10,7 +10,59 @@ from .telegram_api import TelegramAPI
 from .apifree_client import ApiFreeClient
 from .model_registry import models_from_env
 from .bot_logic import handle_update
+import os
+import json
+from typing import Optional, Dict, Any
 
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+import httpx
+import aiosqlite
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- ENV ---
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+APIFREE_API_KEY = os.getenv("APIFREE_API_KEY", "")
+APIFREE_BASE_URL = os.getenv("APIFREE_BASE_URL", "https://api.skycoding.ai").rstrip("/")
+APIFREE_HTTP_TIMEOUT_SEC = int(os.getenv("APIFREE_HTTP_TIMEOUT_SEC", "180"))
+
+IMAGE_TIMEOUT_SEC = int(os.getenv("IMAGE_TIMEOUT_SEC", "3600"))
+IMAGE_POLL_SEC = int(os.getenv("IMAGE_POLL_SEC", "5"))
+VIDEO_TIMEOUT_SEC = int(os.getenv("VIDEO_TIMEOUT_SEC", "7200"))
+VIDEO_POLL_SEC = int(os.getenv("VIDEO_POLL_SEC", "8"))
+
+DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "openai/gpt-5.2")
+GROK_CHAT_MODEL = os.getenv("GROK_CHAT_MODEL", "xai/grok-4")
+DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "google/nano-banana-pro")
+DEFAULT_VIDEO_MODEL = os.getenv("DEFAULT_VIDEO_MODEL", "klingai/kling-v2.6/pro/image-to-video")
+
+# ВАЖНО: для Render диск должен быть /var/data
+DB_PATH = os.getenv("DB_PATH", "/var/data/app.db")
+
+# --- APP ---
+app = FastAPI(title="Mini App Backend", version="1.0.0")
+
+# Абсолютные пути (чтобы на Render точно находило папки)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WEBAPP_DIR = os.path.join(BASE_DIR, "webapp")   # <-- папка app/webapp
+STATIC_DIR = os.path.join(WEBAPP_DIR, "static") # <-- app/webapp/static (если есть)
+
+# 1) Mini App по /webapp/
+app.mount("/webapp", StaticFiles(directory=WEBAPP_DIR, html=True), name="webapp")
+
+# 2) (опционально) статические ассеты, если используешь отдельную папку
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# 3) корень сайта можно редиректить на миниапп
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/webapp/")
 app = FastAPI(title="Creator Kristina Bot (ApiFree)")
 
 storage = Storage(settings.DB_PATH)
