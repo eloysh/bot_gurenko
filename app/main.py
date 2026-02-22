@@ -111,7 +111,13 @@ async def init_db():
 
 async def get_or_create_user(tg_id: int) -> Dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute_fetchone("SELECT tg_id, free_credits, pro_credits FROM users WHERE tg_id=?", (tg_id,))
+        cur = await db.execute(
+            "SELECT tg_id, free_credits, pro_credits FROM users WHERE tg_id=?",
+            (tg_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
         if row:
             return {"tg_id": row[0], "free": row[1], "pro": row[2]}
 
@@ -127,6 +133,38 @@ async def consume_credit(tg_id: int) -> bool:
     if tg_id in ADMIN_TG_IDS:
         return True
 
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT free_credits, pro_credits FROM users WHERE tg_id=?",
+            (tg_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+        if not row:
+            # создаём пользователя и пробуем ещё раз
+            await get_or_create_user(tg_id)
+            return True  # у нового будет INITIAL_FREE
+
+        free, pro = int(row[0]), int(row[1])
+
+        if pro > 0:
+            await db.execute(
+                "UPDATE users SET pro_credits = pro_credits - 1 WHERE tg_id=?",
+                (tg_id,),
+            )
+            await db.commit()
+            return True
+
+        if free > 0:
+            await db.execute(
+                "UPDATE users SET free_credits = free_credits - 1 WHERE tg_id=?",
+                (tg_id,),
+            )
+            await db.commit()
+            return True
+
+        return False
     async with aiosqlite.connect(DB_PATH) as db:
         row = await db.execute_fetchone("SELECT free_credits, pro_credits FROM users WHERE tg_id=?", (tg_id,))
         if not row:
@@ -160,9 +198,16 @@ async def save_job(job_id: str, tg_id: int, kind: str, status: str, model: str, 
 
 async def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute_fetchone("SELECT id, tg_id, kind, status, model, request_json, result_json FROM jobs WHERE id=?", (job_id,))
+        cur = await db.execute(
+            "SELECT id, tg_id, kind, status, model, request_json, result_json FROM jobs WHERE id=?",
+            (job_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
         if not row:
             return None
+
         return {
             "id": row[0],
             "tg_id": row[1],
