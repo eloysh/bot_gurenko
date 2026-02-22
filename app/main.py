@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,6 +20,7 @@ def getenv(name: str, default: str = "") -> str:
 
 BOT_TOKEN = getenv("BOT_TOKEN", "").strip()
 PUBLIC_BASE_URL = getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")  # https://guurenko-ai.onrender.com
+
 APIFREE_API_KEY = getenv("APIFREE_API_KEY", "").strip()
 APIFREE_BASE_URL = getenv("APIFREE_BASE_URL", "https://api.skycoding.ai").strip().rstrip("/")
 APIFREE_HTTP_TIMEOUT_SEC = int(getenv("APIFREE_HTTP_TIMEOUT_SEC", "180"))
@@ -28,30 +28,17 @@ APIFREE_HTTP_TIMEOUT_SEC = int(getenv("APIFREE_HTTP_TIMEOUT_SEC", "180"))
 DB_PATH = getenv("DB_PATH", "/var/data/app.db")
 INITIAL_FREE = int(getenv("INITIAL_FREE", "2"))
 
-# TG admins that bypass credits
 ADMIN_TG_IDS = set()
 for x in getenv("ADMIN_TG_IDS", "").replace(" ", "").split(","):
     if x.strip().isdigit():
         ADMIN_TG_IDS.add(int(x.strip()))
 
-# polling
-IMAGE_POLL_SEC = int(getenv("IMAGE_POLL_SEC", "5"))
-VIDEO_POLL_SEC = int(getenv("VIDEO_POLL_SEC", "8"))
-MUSIC_POLL_SEC = int(getenv("MUSIC_POLL_SEC", "6"))
-
-IMAGE_TIMEOUT_SEC = int(getenv("IMAGE_TIMEOUT_SEC", "3600"))
-VIDEO_TIMEOUT_SEC = int(getenv("VIDEO_TIMEOUT_SEC", "7200"))
-MUSIC_TIMEOUT_SEC = int(getenv("MUSIC_TIMEOUT_SEC", "1800"))
-
-# Web folders
-BASE_DIR = os.path.dirname(__file__)  # .../app
-WEBAPP_DIR = os.path.join(BASE_DIR, "webapp")  # app/webapp
-WEB_DIR = os.path.join(BASE_DIR, "web")        # app/web  (optional)
+BASE_DIR = os.path.dirname(__file__)
+WEBAPP_DIR = os.path.join(BASE_DIR, "webapp")
 
 
 # =========================
-# MODELS (defaults)
-# Формат, который удобно отдавать в /api/models
+# MODELS
 # =========================
 DEFAULT_MODELS = {
     "chat": [
@@ -72,15 +59,13 @@ DEFAULT_MODELS = {
     ],
 }
 
-# Можно переопределить список моделей через ENV:
-# MODELS_JSON='{"chat":[...], "image":[...], "video":[...], "music":[...]}'
+
 def load_models() -> Dict[str, List[Dict[str, Any]]]:
     raw = getenv("MODELS_JSON", "").strip()
     if not raw:
         return DEFAULT_MODELS
     try:
         data = json.loads(raw)
-        # гарантируем ключи
         out = {}
         for k in ["chat", "image", "video", "music"]:
             v = data.get(k)
@@ -96,22 +81,17 @@ MODELS = load_models()
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Creator Mini App Backend", version="2.0.0")
+app = FastAPI(title="Creator Mini App Backend", version="2.0.1")
 
-# Монтируем webapp, только если папка реально существует (чтобы не падало на Render)
+# НЕ ПАДАЕМ если папки нет
 if os.path.isdir(WEBAPP_DIR):
     app.mount("/webapp", StaticFiles(directory=WEBAPP_DIR, html=True), name="webapp")
 
-# Статика (опционально)
-if os.path.isdir(WEB_DIR):
-    app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
-
 
 # =========================
-# DB helpers (aiosqlite 0.20 compatible)
+# DB helpers (aiosqlite compatible)
 # =========================
 async def db_connect() -> aiosqlite.Connection:
-    # гарантируем папку под БД
     d = os.path.dirname(DB_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
@@ -135,9 +115,15 @@ async def db_fetchall(db: aiosqlite.Connection, sql: str, params: Tuple[Any, ...
     return rows
 
 
-async def init_db() -> None:
-    db = await db_connect()
-    try:
+async def ensure_users_schema(db: aiosqlite.Connection) -> None:
+    """
+    Миграция: если таблица users уже существует в старом формате,
+    добавляем недостающие колонки free_credits/pro_credits.
+    """
+    # есть ли таблица
+    row = await db_fetchone(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    if not row:
+        # создадим с нуля
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users(
                 tg_id INTEGER PRIMARY KEY,
@@ -146,12 +132,34 @@ async def init_db() -> None:
                 created_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        return
+
+    # проверяем колонки
+    cols = await db_fetchall(db, "PRAGMA table_info(users)")
+    col_names = {c[1] for c in cols}  # (cid, name, type, notnull, dflt_value, pk)
+
+    if "free_credits" not in col_names:
+        await db.execute("ALTER TABLE users ADD COLUMN free_credits INTEGER NOT NULL DEFAULT 0")
+
+    if "pro_credits" not in col_names:
+        await db.execute("ALTER TABLE users ADD COLUMN pro_credits INTEGER NOT NULL DEFAULT 0")
+
+    if "created_at" not in col_names:
+        # created_at необязателен, но добавим
+        await db.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
+
+
+async def init_db() -> None:
+    db = await db_connect()
+    try:
+        await ensure_users_schema(db)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS jobs(
                 id TEXT PRIMARY KEY,
                 tg_id INTEGER,
-                kind TEXT NOT NULL,              -- chat/image/video/music
-                status TEXT NOT NULL,            -- queued/running/done/error
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
                 model TEXT,
                 provider_id TEXT,
                 request_json TEXT,
@@ -169,6 +177,9 @@ async def init_db() -> None:
 async def get_or_create_user(tg_id: int) -> Dict[str, Any]:
     db = await db_connect()
     try:
+        # на всякий случай повторим миграцию (если кто-то удалил/сломал БД)
+        await ensure_users_schema(db)
+
         row = await db_fetchone(db, "SELECT tg_id, free_credits, pro_credits FROM users WHERE tg_id=?", (tg_id,))
         if row:
             return {"tg_id": row[0], "free": int(row[1]), "pro": int(row[2])}
@@ -189,6 +200,8 @@ async def consume_credit(tg_id: int) -> bool:
 
     db = await db_connect()
     try:
+        await ensure_users_schema(db)
+
         row = await db_fetchone(db, "SELECT free_credits, pro_credits FROM users WHERE tg_id=?", (tg_id,))
         if not row:
             await db.execute(
@@ -215,69 +228,8 @@ async def consume_credit(tg_id: int) -> bool:
         await db.close()
 
 
-def make_job_id() -> str:
-    # короткий уникальный id
-    return f"job_{int(datetime.utcnow().timestamp())}_{os.urandom(4).hex()}"
-
-
-async def save_job(
-    job_id: str,
-    tg_id: Optional[int],
-    kind: str,
-    status: str,
-    model: str,
-    provider_id: Optional[str],
-    request: Dict[str, Any],
-    result: Optional[Dict[str, Any]] = None,
-    error_text: Optional[str] = None,
-) -> None:
-    db = await db_connect()
-    try:
-        await db.execute("""
-            INSERT OR REPLACE INTO jobs(id, tg_id, kind, status, model, provider_id, request_json, result_json, error_text, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,datetime('now'))
-        """, (
-            job_id,
-            tg_id,
-            kind,
-            status,
-            model,
-            provider_id,
-            json.dumps(request, ensure_ascii=False),
-            json.dumps(result or {}, ensure_ascii=False),
-            error_text,
-        ))
-        await db.commit()
-    finally:
-        await db.close()
-
-
-async def load_job(job_id: str) -> Optional[Dict[str, Any]]:
-    db = await db_connect()
-    try:
-        row = await db_fetchone(db, """
-            SELECT id, tg_id, kind, status, model, provider_id, request_json, result_json, error_text
-            FROM jobs WHERE id=?
-        """, (job_id,))
-        if not row:
-            return None
-        return {
-            "id": row[0],
-            "tg_id": row[1],
-            "kind": row[2],
-            "status": row[3],
-            "model": row[4],
-            "provider_id": row[5],
-            "request": json.loads(row[6] or "{}"),
-            "result": json.loads(row[7] or "{}"),
-            "error": row[8],
-        }
-    finally:
-        await db.close()
-
-
 # =========================
-# API FREE client
+# API Free client
 # =========================
 def apifree_headers() -> Dict[str, str]:
     if not APIFREE_API_KEY:
@@ -294,7 +246,6 @@ async def apifree_post(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]
             data = r.json()
         except Exception:
             data = {"raw": r.text}
-
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=data)
     return data
@@ -320,11 +271,11 @@ async def apifree_get(endpoint: str) -> Dict[str, Any]:
 @app.on_event("startup")
 async def _startup() -> None:
     await init_db()
-    # auto webhook (optional)
+
+    # setWebhook (не критично)
     if BOT_TOKEN and PUBLIC_BASE_URL:
         try:
             hook = f"{PUBLIC_BASE_URL}/telegram/webhook/hook"
-            await apifree_get("/__ping") if False else None  # no-op
             async with httpx.AsyncClient(timeout=30) as client:
                 await client.post(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
@@ -336,7 +287,7 @@ async def _startup() -> None:
 
 
 # =========================
-# ROUTES: basic
+# ROUTES
 # =========================
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
@@ -345,23 +296,19 @@ async def health() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
-    # если есть webapp — удобнее отправлять туда
     if os.path.isdir(WEBAPP_DIR):
         return """
         <html><body style="font-family:Arial">
-        <h3>Creator Mini App backend is running ✅</h3>
-        <p>Open mini app: <a href="/webapp/">/webapp/</a></p>
+        <h3>Backend is running ✅</h3>
+        <p>Mini App: <a href="/webapp/">/webapp/</a></p>
         </body></html>
         """
     return "<html><body><h3>Backend is running ✅</h3></body></html>"
 
 
-# =========================
-# MODELS + USER
-# =========================
 @app.get("/api/models")
 async def api_models() -> Dict[str, Any]:
-    # ВАЖНО: именно такой формат нужен, чтобы dropdown’ы заполнялись
+    # фронту нужен именно такой формат
     return {"ok": True, "models": MODELS}
 
 
@@ -371,9 +318,6 @@ async def api_me(tg_id: int) -> Dict[str, Any]:
     return {"ok": True, "user": u}
 
 
-# =========================
-# CHAT
-# =========================
 @app.post("/api/chat")
 async def api_chat(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
     tg_id = body.get("tg_id")
@@ -389,6 +333,7 @@ async def api_chat(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
         if not ok:
             return {"ok": False, "error": "no_credits"}
 
+    # пример совместимого формата (если у провайдера OpenAI-like)
     payload = {"model": model, "messages": [{"role": "user", "content": message}]}
     data = await apifree_post("/v1/chat/completions", payload)
 
@@ -401,14 +346,8 @@ async def api_chat(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
     return {"ok": True, "model": model, "text": text, "raw": data}
 
 
-# =========================
-# IMAGE / VIDEO / MUSIC submit + result
-# IMPORTANT:
-# - submit returns provider_id (чтобы фронт мог сразу дергать /result/{provider_id})
-# - result proxies provider status or returns url
-# =========================
+# ====== GENERATION submit/result ======
 async def submit_generation(kind: str, model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    # kind -> endpoint
     if kind == "image":
         ep = "/v1/images/generations"
     elif kind == "video":
@@ -421,15 +360,12 @@ async def submit_generation(kind: str, model: str, payload: Dict[str, Any]) -> D
     req = {"model": model, **payload}
     data = await apifree_post(ep, req)
 
-    # provider can return:
-    # - {"id": "..."} or {"task_id": "..."} or {"data":[{"id":...}]} etc.
     provider_id = (
         data.get("id")
         or data.get("task_id")
         or (data.get("data")[0].get("id") if isinstance(data.get("data"), list) and data["data"] else None)
     )
 
-    # sometimes provider returns url immediately
     url = data.get("url")
     if not url and isinstance(data.get("data"), list) and data["data"]:
         url = data["data"][0].get("url")
@@ -438,10 +374,7 @@ async def submit_generation(kind: str, model: str, payload: Dict[str, Any]) -> D
 
 
 async def proxy_result(kind: str, provider_id: str) -> Dict[str, Any]:
-    # эти эндпоинты могут отличаться у API Free.
-    # Мы делаем максимально совместимый вариант:
-    # пробуем несколько путей.
-    candidates = []
+    candidates: List[str] = []
     if kind == "image":
         candidates = [f"/v1/images/result/{provider_id}", f"/v1/images/{provider_id}"]
     elif kind == "video":
@@ -449,16 +382,13 @@ async def proxy_result(kind: str, provider_id: str) -> Dict[str, Any]:
     elif kind == "music":
         candidates = [f"/v1/music/result/{provider_id}", f"/v1/music/{provider_id}"]
 
-    last_err = None
+    last: Optional[Exception] = None
     for ep in candidates:
         try:
-            data = await apifree_get(ep)
-            return data
+            return await apifree_get(ep)
         except Exception as e:
-            last_err = e
-            continue
-
-    raise HTTPException(status_code=502, detail={"error": "provider_result_failed", "detail": str(last_err)})
+            last = e
+    raise HTTPException(status_code=502, detail={"error": "provider_result_failed", "detail": str(last)})
 
 
 @app.post("/api/image/submit")
@@ -483,7 +413,6 @@ async def api_image_submit(body: Dict[str, Any] = Body(default={})) -> Dict[str,
 @app.get("/api/image/result/{provider_id}")
 async def api_image_result(provider_id: str) -> Dict[str, Any]:
     data = await proxy_result("image", provider_id)
-    # нормализуем url если провайдер вернул
     url = data.get("url")
     if not url and isinstance(data.get("data"), list) and data["data"]:
         url = data["data"][0].get("url")
@@ -505,7 +434,6 @@ async def api_video_submit(body: Dict[str, Any] = Body(default={})) -> Dict[str,
         if not ok:
             return {"ok": False, "error": "no_credits"}
 
-    # video often needs image(s)
     payload: Dict[str, Any] = {"prompt": prompt}
     if body.get("image"):
         payload["image"] = body.get("image")
@@ -559,7 +487,7 @@ async def api_music_result(provider_id: str) -> Dict[str, Any]:
 
 
 # =========================
-# TELEGRAM WEBHOOK
+# Telegram webhook
 # =========================
 async def tg_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> None:
     if not BOT_TOKEN:
@@ -574,7 +502,7 @@ async def tg_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[s
 @app.post("/telegram/webhook/hook")
 async def telegram_webhook_hook(req: Request) -> Dict[str, Any]:
     update = await req.json()
-    message = (update.get("message") or {})
+    message = update.get("message") or {}
     text = (message.get("text") or "").strip()
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
@@ -583,7 +511,7 @@ async def telegram_webhook_hook(req: Request) -> Dict[str, Any]:
         return {"ok": True}
 
     if text.startswith("/start"):
-        miniapp_url = PUBLIC_BASE_URL + "/webapp/" if PUBLIC_BASE_URL else "/webapp/"
+        miniapp_url = (PUBLIC_BASE_URL + "/webapp/") if PUBLIC_BASE_URL else "/webapp/"
         await tg_send_message(
             chat_id,
             "Привет! Открывай Mini App 👇",
@@ -593,7 +521,4 @@ async def telegram_webhook_hook(req: Request) -> Dict[str, Any]:
                 ]]
             }
         )
-        return {"ok": True}
-
-    # Можно расширить: команды /help и т.д.
     return {"ok": True}
